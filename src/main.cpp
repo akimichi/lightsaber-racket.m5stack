@@ -14,6 +14,7 @@ uint32_t lastDisplayMs = 0;
 
 void setup() {
   auto cfg = M5.config();
+  cfg.serial_baudrate = 115200;  // 既定値 0 では Serial.begin が呼ばれない
   M5.begin(cfg);
 
   M5.Display.setRotation(1);
