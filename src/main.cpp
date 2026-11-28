@@ -1,38 +1,47 @@
-// M2: Grove 給電で LED テープを点灯させ、R1 (データ信号レベル) と R2 (電流・電圧降下) を確認する。
-// 消灯 → 赤 → 緑 → 青 → 白 → 流れる点 を繰り返す。
+// M3: ジャイロの角速度でスウィングを検出し、LED の色を変える。
 #include <M5Unified.h>
 
 #include <FastLED.h>
+#include <math.h>
 
 #include "config.h"
+#include "led_effects.h"
+#include "swing_detector.h"
 
 namespace {
 
-enum class TestStep : uint8_t { Off, Red, Green, Blue, White, Chase, Count };
-
-const char* const kStepNames[] = {"OFF", "RED", "GREEN", "BLUE", "WHITE", "CHASE"};
-
 CRGB leds[config::kLedCount];
-TestStep step = TestStep::Off;
-uint32_t stepStartMs = 0;
+SwingDetector detector(config::kSwing);
 uint32_t lastFrameMs = 0;
 uint32_t lastDisplayMs = 0;
-uint16_t chasePos = 0;
+bool displayDirty = true;
 
-void applyStep() {
-  switch (step) {
-    case TestStep::Off:   fill_solid(leds, config::kLedCount, CRGB::Black); break;
-    case TestStep::Red:   fill_solid(leds, config::kLedCount, CRGB::Red);   break;
-    case TestStep::Green: fill_solid(leds, config::kLedCount, CRGB::Green); break;
-    case TestStep::Blue:  fill_solid(leds, config::kLedCount, CRGB::Blue);  break;
-    case TestStep::White: fill_solid(leds, config::kLedCount, CRGB::White); break;
-    case TestStep::Chase:
-      fill_solid(leds, config::kLedCount, CRGB::Black);
-      leds[chasePos] = CRGB::White;
-      break;
-    default: break;
+const char* stateName(SwingState state) {
+  switch (state) {
+    case SwingState::Idle:      return "IDLE";
+    case SwingState::Swing:     return "SWING";
+    case SwingState::Afterglow: return "AFTERGLOW";
   }
-  FastLED.show();
+  return "?";
+}
+
+Hsv currentColor(uint32_t now) {
+  if (detector.state() == SwingState::Idle) {
+    return idleColor(now, config::kIdleColor);
+  }
+  return swingColor(detector.levelDps(), config::kSwingColor);
+}
+
+// 画面の状態表示は IDLE / SWING の 2 種類。AFTERGLOW は SWING の続きとして扱う。
+void drawState() {
+  M5.Display.setCursor(0, 0);
+  M5.Display.printf("%-5s\n", detector.state() == SwingState::Idle ? "IDLE" : "SWING");
+}
+
+void drawAll() {
+  drawState();
+  M5.Display.printf("peak %4.0f dps\nbat %3d %%\n", detector.peakDps(),
+                    static_cast<int>(M5.Power.getBatteryLevel()));
 }
 
 }  // namespace
@@ -51,40 +60,43 @@ void setup() {
   FastLED.clear(true);
 
   // EXT_5V を出力にする。この状態で Grove 側から給電してはならない。
-  const bool extOk = M5.Power.setExtOutput(true);
-  Serial.printf("setExtOutput: %s\n", extOk ? "ok" : "failed");
-
-  stepStartMs = millis();
-  applyStep();
+  if (!M5.Power.setExtOutput(true)) {
+    Serial.println("setExtOutput failed");
+  }
 }
 
 void loop() {
   M5.update();
   const uint32_t now = millis();
 
-  if (now - stepStartMs >= config::kTestStepMs) {
-    stepStartMs = now;
-    step = static_cast<TestStep>((static_cast<uint8_t>(step) + 1) %
-                                 static_cast<uint8_t>(TestStep::Count));
-    chasePos = 0;
-    applyStep();
-  } else if (step == TestStep::Chase && now - lastFrameMs >= config::kTestFrameMs) {
-    lastFrameMs = now;
-    chasePos = (chasePos + 1) % config::kLedCount;
-    applyStep();
+  if (M5.Imu.update() & m5::IMU_Class::sensor_mask_gyro) {
+    const auto data = M5.Imu.getImuData();
+    const float gyroDps = sqrtf(data.gyro.x * data.gyro.x + data.gyro.y * data.gyro.y +
+                    data.gyro.z * data.gyro.z);
+    const SwingState before = detector.state();
+    const SwingState after = detector.update(gyroDps, now);
+    if (after != before) {
+      Serial.printf("%lu,%s,peak=%.0f\n", static_cast<unsigned long>(now), stateName(after),
+                    detector.peakDps());
+      if (after == SwingState::Idle) {
+        displayDirty = true;
+      } else if (before == SwingState::Idle) {
+        drawState();
+      }
+    }
   }
 
-  if (now - lastDisplayMs >= config::kDisplayIntervalMs) {
+  if (now - lastFrameMs >= config::kLedFrameMs) {
+    lastFrameMs = now;
+    const Hsv c = currentColor(now);
+    fill_solid(leds, config::kLedCount, CHSV(c.hue, c.sat, c.val));
+    FastLED.show();
+  }
+
+  if (detector.state() == SwingState::Idle &&
+      (displayDirty || now - lastDisplayMs >= config::kDisplayRefreshMs)) {
+    displayDirty = false;
     lastDisplayMs = now;
-    const char* name = kStepNames[static_cast<uint8_t>(step)];
-    const float extMv = M5.Power.getExtVoltage(m5::ext_MAIN);
-    const int batMv = M5.Power.getBatteryVoltage();
-    const int batMa = M5.Power.getBatteryCurrent();
-    const int bright = FastLED.getBrightness();
-    M5.Display.setCursor(0, 0);
-    M5.Display.printf("M2 LED test\n%-6s\n5V %4.0f mV\nbat %4d mV\n    %4d mA\n",
-                      name, extMv, batMv, batMa);
-    Serial.printf("%s,ext_mV=%.0f,bat_mV=%d,bat_mA=%d,brightness=%d\n",
-                  name, extMv, batMv, batMa, bright);
+    drawAll();
   }
 }
